@@ -61,6 +61,7 @@ const loaders = DEV_SERVER_PORT => [
 const commonPlugins = [
 	new webpack.ProvidePlugin( {
 		React: `react`,
+		Promise: `bluebird`,
 		autobind: `autobind-decorator`,
 	} ),
 ]

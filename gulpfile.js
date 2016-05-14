@@ -1,4 +1,6 @@
 const Promise = require( "bluebird" )
+const fs = require( "fs" )
+Promise.promisifyAll( fs )
 const path = require( "path" )
 const stream = require( "stream" )
 const child_process = require( "child_process" )
@@ -8,7 +10,6 @@ const babel = require( "gulp-babel" )
 const filter = require( "gulp-filter" )
 const insert = require( "gulp-insert" )
 const newer = require( "gulp-newer" )
-const plumber = require( "gulp-plumber" )
 const gutil = require( "gulp-util" )
 const watch = require( "gulp-watch" )
 const del = require( "del" )
@@ -23,10 +24,14 @@ const paths = {
 	src: `${ webpackConfig.context }/**/*.{js,json}`,
 	flow: `${ webpackConfig.root }/.compiled/compiled_flow_modules`,
 	flowConfig: `${ webpackConfig.root }/config/.flowconfig`,
+	compile_log: `${ webpackConfig.root }/.compiled/compiler.log`,
 }
 
 
 const DEV_SERVER_PORT = 3000
+
+
+const PAGER = `\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n`
 
 
 const through = () => new stream.PassThrough( { objectMode: true } )
@@ -50,28 +55,51 @@ const getErrorMessage = error => {
 }
 
 
-const toPromise = value => Promise.resolve( value ).then( value =>
-	value && typeof value.pipe === `function` && typeof value.on === `function`
-	? new Promise( ( resolve, reject ) => value
-		.on( `data`, _ => _ )
-		.on( `end`, resolve )
-		.on( `error`, reject )
-	)
-	: value
+const stripESC = text => text.replace( /\x1b.*?m/g, `` )
+
+
+const writeCompileLog = text => {
+	if ( paths.compile_log )
+		return fs.writeFileAsync( paths.compile_log, stripESC( text ) )
+}
+
+
+const streamToPromise = stream => new Promise( ( resolve, reject ) => stream
+	.on( `data`, _ => _ )
+	.once( `end`, resolve )
+	.once( `error`, reject )
 )
+
+
+const catchStreamError = stream => {
+	const pipe = stream.pipe
+	stream.pipe = function ( dest, options ) {
+		stream.once( `error`, error => dest.emit( `error`, error ) )
+		return catchStreamError( pipe.call( this, dest, options ) )
+	}
+	return stream
+}
+
+
+const normalizeErrorMessage = error => {
+	const msg = getErrorMessage( error )
+	if ( error.message !== msg )
+		error = new Error( msg )
+	return error
+}
 
 
 const flowPrepare = () => {
 	const jsFilter = filter( `**/*.js`, { restore: true } )
-	return toPromise(
-		gulp.src( paths.src )
-		.pipe( plumber( { errorHandler( error ) { gutil.log( getErrorMessage( error ) ) } } ) )
+	return streamToPromise(
+		catchStreamError( gulp.src( paths.src ) )
 		.pipe( newer( paths.flow ) )
 		.pipe( through().on( `data`, file =>
 			gutil.log( `Compiling: ${ gutil.colors.cyan( path.relative( webpackConfig.root, file.path ) ) } ...` )
 		) )
 		.pipe( jsFilter )
 		.pipe( babel( {
+			retainLines: true,
 			plugins: [
 				`syntax-flow`,
 				`syntax-jsx`,
@@ -85,7 +113,7 @@ const flowPrepare = () => {
 				`transform-exponentiation-operator`,
 			],
 		} ) )
-		.pipe( insert.prepend( `/*@flow*/` ) )
+		.pipe( insert.transform( contents => `/*@flow*/${ contents.replace( /\[\s*Symbol\s*\.\s*iterator\s*\]\s*\(\s*\)/g, `@@iterator()` ) }` ) )
 		.pipe( jsFilter.restore )
 		.pipe( gulp.dest( paths.flow ) )
 	)
@@ -146,9 +174,20 @@ gulp.task( `default`, [ `clean` ], Promise.coroutine( function* () {
 
 
 const compile = Promise.coroutine( function* () {
-	yield flowCheck()
-	yield webpackRun( webpackConfig.createServer() )
-	webpackDevServerRun()
+	if ( PAGER )
+		console.log( PAGER )
+	try {
+		yield writeCompileLog( `Compiling...` )
+		yield flowCheck()
+		yield webpackRun( webpackConfig.createServer() )
+		webpackDevServerRun()
+		yield writeCompileLog( `Success.` )
+	}
+	catch ( error ) {
+		error = normalizeErrorMessage( error )
+		yield writeCompileLog( `Errors:\n${ error.message }` )
+		throw error
+	}
 } )
 gulp.task( `compile`, compile )
 
@@ -163,7 +202,7 @@ gulp.task( `dev`, [ `clean` ], Promise.coroutine( function* () {
 		gutil.log( `Aborting: ${ gutil.colors.cyan( path.relative( webpackConfig.root, data.path ) ) } has been ${ gutil.colors.red( data.type ) }.` )
 		setTimeout( () => process.exit( 1 ), 200 )
 	} )
-	yield compile().catch( error => gutil.log( getErrorMessage( error ) ) )
+	yield compile().catch( error => gutil.log( error.message ) )
 	gulp.watch( [
 		paths.src,
 		paths.flowConfig,
