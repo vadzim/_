@@ -1,31 +1,33 @@
 const Promise = require( "bluebird" )
+Promise.coroutine.addYieldHandler( Promise.resolve )
 const fs = require( "fs" )
 Promise.promisifyAll( fs )
 const path = require( "path" )
 const stream = require( "stream" )
 const child_process = require( "child_process" )
 const lodash = require( "lodash" )
+const chokidar = require( "chokidar" )
 const gulp = require( "gulp" )
 const babel = require( "gulp-babel" )
 const filter = require( "gulp-filter" )
 const insert = require( "gulp-insert" )
 const newer = require( "gulp-newer" )
+const sourcemaps = require( "gulp-sourcemaps" )
 const gutil = require( "gulp-util" )
-const watch = require( "gulp-watch" )
+const clean = require( "./build/gulp-clean-removed" )
+const asyncDebounce = require( "./build/async-debounce" )
+const File = require( "vinyl" )
 const del = require( "del" )
+const mkdirp = require( "mkdirp" )
+mkdirp.async = Promise.promisify( mkdirp )
 const flow = require( "flow-bin" )
 const webpack = require( "webpack" )
 const WebpackDevServer = require( "webpack-dev-server" )
 const webpackConfig = require( "./config/webpack.config.js" )
+const useif = ( condition, ...items ) => condition ? items : []
 
 
-const paths = {
-	root: webpackConfig.root,
-	src: `${ webpackConfig.context }/**/*.{js,json}`,
-	flow: `${ webpackConfig.root }/.compiled/compiled_flow_modules`,
-	flowConfig: `${ webpackConfig.root }/config/.flowconfig`,
-	compile_log: `${ webpackConfig.root }/.compiled/compiler.log`,
-}
+const paths = webpackConfig.paths
 
 
 const DEV_SERVER_PORT = 3000
@@ -58,12 +60,6 @@ const getErrorMessage = error => {
 const stripESC = text => text.replace( /\x1b.*?m/g, `` )
 
 
-const writeCompileLog = text => {
-	if ( paths.compile_log )
-		return fs.writeFileAsync( paths.compile_log, stripESC( text ) )
-}
-
-
 const streamToPromise = stream => new Promise( ( resolve, reject ) => stream
 	.on( `data`, _ => _ )
 	.once( `end`, resolve )
@@ -89,31 +85,88 @@ const normalizeErrorMessage = error => {
 }
 
 
+const printFileCmd = ( msg, file ) => gutil.log( `${ msg }: ${ gutil.colors.cyan( path.relative( paths.root, file.path ) ) }...` )
+
+
+const writeFile = Promise.coroutine( function* ( filename, text ) {
+	yield mkdirp.async( path.dirname( filename ) )
+	yield fs.writeFileAsync( filename, text )
+} )
+
+const writeCompileLog = text => paths.compileLog && writeFile( paths.compileLog, stripESC( text ) )
+
+
+const babelSyntax = [
+	`syntax-flow`,
+	`syntax-jsx`,
+
+	`syntax-async-functions`,
+	`syntax-async-generators`,
+	`syntax-object-rest-spread`,
+	`syntax-trailing-function-commas`,
+	`syntax-decorators`,
+]
+
+
+const jsPrepare = dev => {
+	const dest = dev ? paths.dev : paths.bin
+	const jsFilter = filter( `**/*.js`, { restore: true } )
+	return streamToPromise(
+		catchStreamError( gulp.src( `${ paths.src }/**/*` ) )
+		.pipe( clean( dest, `.map` ) )
+		.on( `unlink`, file => printFileCmd( `Deleting`, file ) )
+		.pipe( newer( dest ) )
+		.on( `data`, file => dev || printFileCmd( `Compiling`, file ) )
+		.pipe( jsFilter )
+		.pipe( dev ? sourcemaps.init() : through() )
+		.pipe( babel( {
+			retainLines: true,
+			plugins: [
+				...babelSyntax,
+				`transform-flow-strip-types`,
+			],
+		} ) )
+		.pipe( babel( {
+			plugins: [
+				`transform-decorators-legacy`,
+				[ `transform-async-to-module-method`, {
+					module: `bluebird`,
+					method: `coroutine`,
+				} ],
+			],
+			presets: [
+				`stage-0`,
+				`react`,
+				...useif( dev,
+					`react-hmre`
+				),
+				`es2015`,
+			],
+		} ) )
+		.pipe( dev ? sourcemaps.write( `.` ) : through() )
+		.pipe( jsFilter.restore )
+		.pipe( gulp.dest( dest ) )
+	)
+}
+
+
 const flowPrepare = () => {
 	const jsFilter = filter( `**/*.js`, { restore: true } )
 	return streamToPromise(
-		catchStreamError( gulp.src( paths.src ) )
+		catchStreamError( gulp.src( `${ paths.src }/**/*.{js,json}` ) )
+		.pipe( clean( paths.flow ) )
+		.on( `unlink`, file => printFileCmd( `Deleting`, file ) )
 		.pipe( newer( paths.flow ) )
-		.pipe( through().on( `data`, file =>
-			gutil.log( `Compiling: ${ gutil.colors.cyan( path.relative( webpackConfig.root, file.path ) ) } ...` )
-		) )
+		.on( `data`, file => printFileCmd( `To flow`, file ) )
 		.pipe( jsFilter )
 		.pipe( babel( {
 			retainLines: true,
 			plugins: [
-				`syntax-flow`,
-				`syntax-jsx`,
-
-				`syntax-async-functions`,
-				`syntax-async-generators`,
-				`syntax-object-rest-spread`,
-				`syntax-trailing-function-commas`,
-				`syntax-decorators`,
-
+				...babelSyntax,
 				`transform-exponentiation-operator`,
 			],
 		} ) )
-		.pipe( insert.transform( contents => `/*@flow*/${ contents.replace( /\[\s*Symbol\s*\.\s*iterator\s*\]\s*\(\s*\)/g, `@@iterator()` ) }` ) )
+		.pipe( insert.transform( contents => `/*@flow*/${ contents.replace( /\[\s*Symbol\s*\.\s*iterator\s*\]\s*\(\s*\)\s*\{/g, `@@iterator(){` ) }` ) )
 		.pipe( jsFilter.restore )
 		.pipe( gulp.dest( paths.flow ) )
 	)
@@ -130,7 +183,8 @@ const flowRun = () => new Promise( ( resolve, reject ) =>
 )
 
 
-const flowCheck = Promise.coroutine( function* () {
+const js = Promise.coroutine( function* () {
+	yield jsPrepare( false )
 	yield flowPrepare()
 	yield flowRun()
 } )
@@ -164,11 +218,11 @@ const webpackDevServerRun = lodash.once( () =>
 )
 
 
-gulp.task( `clean`, () => del( [ paths.flow, ...webpackConfig.dirsToClean, ] ) )
+gulp.task( `clear`, () => del( [ paths.flow, ...paths.dirsToClean, ] ) )
 
 
-gulp.task( `default`, [ `clean` ], Promise.coroutine( function* () {
-	yield flowCheck()
+gulp.task( `default`, [ `clear` ], Promise.coroutine( function* () {
+	yield js()
 	yield webpackRun( webpackConfig )
 } ) )
 
@@ -178,7 +232,8 @@ const compile = Promise.coroutine( function* () {
 		console.log( PAGER )
 	try {
 		yield writeCompileLog( `Compiling...` )
-		yield flowCheck()
+		yield js()
+		yield jsPrepare( true )
 		yield webpackRun( webpackConfig.createServer() )
 		webpackDevServerRun()
 		yield writeCompileLog( `Success.` )
@@ -192,20 +247,21 @@ const compile = Promise.coroutine( function* () {
 gulp.task( `compile`, compile )
 
 
-gulp.task( `dev`, [ `clean` ], Promise.coroutine( function* () {
-	gulp.watch( [
+const watch = ( files, cb ) => chokidar.watch( files ).on( `ready`, function () { this.on( `all`, cb ) } )
+
+
+gulp.task( `dev`, [ `clear` ], () => {
+	watch( [
 		__filename,
 		...Object.keys( require.cache ),
-	], data => {
-		if ( data.type === `added` )
-			return
-		gutil.log( `Aborting: ${ gutil.colors.cyan( path.relative( webpackConfig.root, data.path ) ) } has been ${ gutil.colors.red( data.type ) }.` )
+	], ( event, filename ) => {
+		gutil.log( `Aborting: ${ gutil.colors.cyan( path.relative( paths.root, filename ) ) } has been touched.` )
 		setTimeout( () => process.exit( 1 ), 200 )
 	} )
-	yield compile().catch( error => gutil.log( error.message ) )
-	gulp.watch( [
-		paths.src,
-		paths.flowConfig,
-	], [ `compile` ] )
-} ) )
+
+	const compiler = asyncDebounce( () => compile().catch( error => gutil.log( error.message ) ) )
+
+	watch( [ paths.src, paths.flowConfig ], compiler )
+	compiler()
+} )
 
