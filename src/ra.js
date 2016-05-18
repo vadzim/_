@@ -1,23 +1,57 @@
 import { spawn } from "th"
 
+// TODO: report a bug in syntax highlighting if type declaration lacks ending semicolon.
 declare type MayBePromise<T> = Promise<T> | T;
 declare type MayBePromiseCalc<T> = () => MayBePromise<T>;
+declare type IsEqual<T> = ( a: T, b: T ) => boolean;
 
 function isGenerator( g: any ) {
 	return g != null && typeof g === `object` && typeof g.next === `function` && typeof g.throw === `function` && typeof g.return === `function`
 }
 
-class Cell<T> {
+class Child<P: Parent> {
+	constructor( owner: ?P ) {
+		this._owner = owner
+		if ( owner )
+			( owner._children || ( owner._children = [] ) ).push( this )
+	}
+	close() {
+	}
+	_owner
+}
 
-	constructor( initial: T ) {
+class Parent<P: Parent, C: Child> extends Child<P> {
+	constructor( owner: ?P ) {
+		super( owner )
+		this._children = null
+	}
+	close() {
+		this.closeChildren()
+		super.close()
+	}
+	closeChildren() {
+		if ( this._children ) {
+			for ( const child of this._children )
+				child.close()
+			this._children.length = 0
+		}
+	}
+	_children: ?Array<C>
+}
+
+class Cell<T> extends Child<Watcher> {
+
+	constructor( initial: T, error: ?Object, isEqual: IsEqual<T>, owner = activeWatcher ) {
+		super( owner )
+		this._isEqual = isEqual
 		this._value = initial
+		this._error = error
 		this._depth = 0
-		this._error = null
 		this._out = new Set
 	}
 
 	read(): T {
-		if ( activeWatcher ) {
+		if ( activeWatcher && activeWatcher !== this._owner ) {
 			this._out.add( activeWatcher )
 			activeWatcher._in.add( this )
 			if ( activeWatcher._cell._depth <= this._depth )
@@ -29,10 +63,8 @@ class Cell<T> {
 			return this._value
 	}
 
-	set( value: T, error: ?Object ): void {
-		if ( activeWatcher )
-			throw new Error( `cannot assign a value while running a calulator` )
-		if ( this._value !== value || this._error !== error ) {
+	_store( value: T, error: ?Object ): void {
+		if ( error ? this._error !== error : !this._isEqual( this._value, value ) ) {
 			this._value = value
 			this._error = error
 			if ( this._out.size > 0 ) {
@@ -51,94 +83,110 @@ class Cell<T> {
 		}
 	}
 
+	changing() {
+		if ( activeWatcher !== this._owner )
+			throw new Error( `cannot assign a value while running a calulator` )
+	}
+
 	write( value: T ): void {
-		return this.set( value, null )
+		this.changing()
+		return this._store( value, null )
 	}
 
 	throw( error: Object ): void {
-		return this.set( ( null: any ), error )
+		this.changing()
+		return this._store( ( null: any ), error )
+	}
+
+	close() {
+		this._store( ( null: any ), new Error( `closed` ) )
+		super.close()
 	}
 
 	_value: T
 	_error: ?Object
 	_depth: number
 	_out: Set<Watcher>
+	_isEqual: IsEqual<T>
 }
 
 const OBJECT = {}
 
-class Watcher<T> {
+class Watcher<T> extends Parent<Watcher, Child> {
 
-	constructor( calculator: MayBePromiseCalc<T> ) {
-		this._initialized = false
+	constructor( calculator: MayBePromiseCalc<T>, isEqual: IsEqual<T>, owner = activeWatcher ) {
+		super( owner )
 		this._running = null
 		this._calculator = calculator
-		this._cell = new Cell( ( null: any ) )
+		this._cell = new Cell( ( ( null: any ): T ), new Error( `not initialized` ), isEqual, null )
 		this._in = new Set
 	}
 
-	close() {}
+	close() {
+		this.unwise()
+		this._cell.close()
+		super.close()
+	}
 
 	read(): T {
-		if ( !this._initialized )
-			throw new Error( `still not initialized` )
 		return this._cell.read()
 	}
 
 	calc() {
 		this.unwise()
-		activeWatcher = this
 		this._running = OBJECT
 		try {
-			let ret: MayBePromise = ( null, this._calculator )()
-			activeWatcher = null
+			let ret
+			const old = activeWatcher
+			activeWatcher = this
+			try {
+				ret = ( ( null, this._calculator )(): any )
+			}
+			finally {
+				activeWatcher = old
+			}
 			if ( isGenerator( ret ) ) {
-				const g: any = ret
-				ret = spawn( wrap( () => g ) )
+				const g = ( new GeneratorProxy( this, ( ret: any ) ): any )
+				ret = spawn( () => g )
 			}
 			if ( ret != null && typeof ret === `object` )
 				this._running = ret
 			Promise.resolve( ret ).then(
 				value => {
 					this._running = null
-					this._initialized = true
-					this._cell.write( value )
+					this._cell._store( value, null )
 				},
 				error => {
 					this._running = null
-					this._initialized = true
-					this._cell.throw( error )
+					this._cell._store( ( null: any ), error )
 				},
 			)
 		}
 		catch ( error ) {
-			activeWatcher = null
 			this._running = null
-			this._initialized = true
-			this._cell.throw( error )
+			this._cell._store( ( null: any ), error )
 		}
 	}
 
 	unwise() {
+		this.closeChildren()
 		for ( const cell of this._in )
 			cell._out.delete( this )
 		this._in.clear()
 		this._cell._depth = 0
 		const running = this._running
 		this._running = null
-		if ( running && typeof running.cancel === `function` )
+		if ( running && typeof running.then === `function` && typeof running.cancel === `function` )
 			running.cancel()
 	}
 
 	_calculator: MayBePromiseCalc<T>
-	_initialized: boolean
 	_running: ?Object
 	_cell: Cell<T>
 	_in: Set<Cell>
 	_next: ?Watcher<number>
 }
 
-// TODO: report a bug in syntax highlighting if type declaration lacks ending semicolon.
 declare type QueueNext<T> = T & { _next: ?QueueNext<T> };
 
 class Queue<T> {
@@ -214,16 +262,23 @@ declare type Calculatable<T> = {
 	close: () => void,
 };
 
-export function val<T>( initial: T ): Value<T> {
-	const v = new Cell( initial )
+// TODO: report a bug in babel. Following line does not restored properly after parsing and generating code back:
+// export function val<T>( initial: T, isEqual: IsEqual<T> = Object.is ): Value<T> {}
+// is reproduced as
+// export function val<T>( initial: T, isEqual = Object.is ): Value<T> {}
+// Type declaration 'IsEqual<T>' is removed.
+// Workaround is to declare type via comment.
+
+export function val<T>( initial: T, isEqual/*: IsEqual<T>*/ = Object.is ): Value<T> {
+	const v = new Cell( initial, null, isEqual )
 	const ret = () => v.read()
 	ret.assign = value => v.write( value )
 	ret.throw = error => v.throw( error )
 	return ret
 }
 
-export function run<T>( calculator: MayBePromiseCalc<T> ): Calculatable<T> {
-	const w = new Watcher( calculator )
+export function run<T>( calculator: MayBePromiseCalc<T>, isEqual/*: IsEqual<T>*/ = Object.is ): Calculatable<T> {
+	const w = new Watcher( calculator, isEqual )
 	const ret = () => w.read()
 	ret.close = () => w.close()
 	return ret
@@ -238,30 +293,33 @@ class GeneratorProxy {
 		return this
 	}
 	next( value ) {
+		const old = activeWatcher
 		activeWatcher = this._w
 		try {
 			return this._g.next( value )
 		}
 		finally {
-			activeWatcher = null
+			activeWatcher = old
 		}
 	}
 	throw( value ) {
+		const old = activeWatcher
 		activeWatcher = this._w
 		try {
 			return this._g.throw( value )
 		}
 		finally {
-			activeWatcher = null
+			activeWatcher = old
 		}
 	}
 	return( value ) {
+		const old = activeWatcher
 		activeWatcher = this._w
 		try {
 			return this._g.return( value )
 		}
 		finally {
-			activeWatcher = null
+			activeWatcher = old
 		}
 	}
 	_g: Generator
@@ -272,7 +330,7 @@ export function wrap<T: Function>( f: T ): T {
 	return ( ( function () {
 		let ret = f.apply( this.arguments )
 		if ( activeWatcher )
-			ret = new GeneratorProxy( activeWatcher, ret )
+			ret = ( new GeneratorProxy( activeWatcher, ( ret : any ) ): any )
 		return ret
 	} : any ) : T )
 }
