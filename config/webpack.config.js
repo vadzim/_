@@ -5,15 +5,21 @@ const OfflinePlugin = require( "offline-plugin" )
 const useif = ( condition, ...items ) => condition ? items : []
 
 
-const root = path.resolve( `${ __dirname }/..` )
-const paths = {
-	root,
-	context: `${ root }/src`,
-	dist: `${ root }/dist`,
-}
+const paths = {}
+paths.root = path.resolve( `${ __dirname }/..` )
+paths.src = `${ paths.root }/src`
+paths.tmp = `${ paths.root }/.compiled`
+paths.compileLog =`${ paths.tmp }/compiler.log`
+paths.dev = `${ paths.tmp }/dev`
+paths.bin = `${ paths.tmp }/bin`
+paths.flow = `${ paths.tmp }/compiled_flow_modules`
+paths.flowConfig = `${ paths.root }/config/.flowconfig`
+paths.dist = `${ paths.root }/dist`
+paths.dirsToClean = [ paths.tmp, paths.dist ]
 
 
 const commonPolyfills = [ `babel-polyfill` ]
+
 
 const preLoaders = [
 	{
@@ -29,34 +35,14 @@ const preLoaders = [
 	},
 ]
 
+
 const loaders = DEV_SERVER_PORT => [
 	{
 		test: /\.json$/,
 		loader: `json`,
 	},
-	{
-		test: /\.jsx?$/,
-		exclude: /(node_modules|bower_components)/,
-		loader: `babel`,
-		query: {
-			plugins: [
-				`transform-decorators-legacy`,
-				[ `transform-async-to-module-method`, {
-					module: `bluebird`,
-					method: `coroutine`,
-				} ],
-			],
-			presets: [
-				`stage-0`,
-				`react`,
-				...useif( DEV_SERVER_PORT,
-					`react-hmre`
-				),
-				`es2015`,
-			],
-		}
-	},
 ]
+
 
 const commonPlugins = [
 	new webpack.ProvidePlugin( {
@@ -67,7 +53,7 @@ const commonPlugins = [
 ]
 
 const createApp = DEV_SERVER_PORT => [ {
-	context: paths.context,
+	context: DEV_SERVER_PORT ? paths.dev : paths.bin,
 	entry: [
 		...useif( DEV_SERVER_PORT,
 			`webpack-dev-server/client?http://localhost:${ DEV_SERVER_PORT }/`,
@@ -80,7 +66,7 @@ const createApp = DEV_SERVER_PORT => [ {
 		path: paths.dist,
 	},
 	resolve: {
-		root: paths.context,
+		root: DEV_SERVER_PORT ? paths.dev : paths.bin,
 	},
 	target: `web`,
 	module: {
@@ -104,7 +90,7 @@ const createApp = DEV_SERVER_PORT => [ {
 } ]
 
 const createServer = () => [ {
-	context: paths.context,
+	context: paths.bin,
 	entry: {
 		server: [ ...commonPolyfills, `./server.js` ],
 	},
@@ -113,7 +99,7 @@ const createServer = () => [ {
 		filename: `[name].js`,
 	},
 	resolve: {
-		root: paths.context,
+		root: paths.bin,
 	},
 	target: `node`,
 	module: {
@@ -134,6 +120,4 @@ module.exports = exports = [
 ]
 exports.createApp = createApp
 exports.createServer = createServer
-exports.root = paths.root
-exports.context = paths.context
-exports.dirsToClean = [ paths.dist ]
+exports.paths = paths
